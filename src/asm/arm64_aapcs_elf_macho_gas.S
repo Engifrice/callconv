@@ -15,8 +15,8 @@
  *
  * Hardening (ELF only): every entry starts with BTI c and signs the return
  * address with PAC (both are NOPs on hardware without the features), and
- * the object carries the BTI and PAC GNU properties, so linking callconv
- * never disables BTI for the final binary.
+ * the object carries the BTI, PAC and GCS GNU properties, so linking
+ * callconv never disables these features for the final binary.
  *********************************************************************/
 
 #if defined(__APPLE__)
@@ -160,7 +160,14 @@ CC_SYM(callconv_internal_spill):
 
 #if !defined(__APPLE__)
 /*-------------------------------------------------------------------
- * GNU property note: BTI (bit 0) and PAC (bit 1)
+ * GNU property note: BTI (bit 0), PAC (bit 1) and GCS (bit 2)
+ *
+ * GCS (Guarded Control Stack) checks every return against a shadow stack
+ * of return addresses. Both routines only return through the x30 pushed
+ * by their caller's BL (saved and restored unchanged), so they are
+ * compatible. Compilers emit the GCS bit for -mbranch-protection=standard
+ * (Clang 18+, GCC 15+): without it here, linking callconv would disable
+ * GCS for the whole binary.
  *-------------------------------------------------------------------*/
         .section .note.gnu.property, "a"
         .p2align 3
@@ -170,7 +177,7 @@ CC_SYM(callconv_internal_spill):
         .asciz  "GNU"
         .long   0xc0000000              /* GNU_PROPERTY_AARCH64_FEATURE_1_AND */
         .long   4                       /* data size */
-        .long   3                       /* BTI | PAC */
+        .long   7                       /* BTI | PAC | GCS */
         .long   0                       /* padding */
 
         .section .note.GNU-stack, "", %progbits

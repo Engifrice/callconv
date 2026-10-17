@@ -12,19 +12,24 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Runner images are pinned: a moving "-latest" label would change the
+# toolchains (and the results) without any change in this repository.
 # Every configuration is built and tested in Debug and Release, because the
 # compiler-generated calls differ between optimization levels and both must
 # agree with the assembly.
 
 jobs:
   unix:
-    name: ${{ matrix.name }} (${{ matrix.build_type }})
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.config.name }} (${{ matrix.build_type }})
+    runs-on: ${{ matrix.config.os }}
     strategy:
       fail-fast: false
+      # Two axes, so every configuration runs in both build types. (Listing
+      # the configurations under "include" next to build_type would not:
+      # each entry would overwrite the previous one in the same two jobs.)
       matrix:
         build_type: [Debug, Release]
-        include:
+        config:
           # System V x86_64, ELF
           - { name: linux-x64-gcc,     os: ubuntu-24.04,     cc: gcc,   cxx: g++ }
           - { name: linux-x64-clang,   os: ubuntu-24.04,     cc: clang, cxx: clang++ }
@@ -46,14 +51,14 @@ jobs:
       - name: Versions
         run: |
           cmake --version
-          ${{ matrix.cxx }} --version
+          ${{ matrix.config.cxx }} --version
 
       - name: Configure
         run: >
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          -DCMAKE_C_COMPILER=${{ matrix.cc }}
-          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_C_COMPILER=${{ matrix.config.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }}
 
       - name: Build
         run: cmake --build build --parallel
@@ -62,13 +67,13 @@ jobs:
         run: ./build/tests/callconv_tests
 
   windows:
-    name: ${{ matrix.name }} (${{ matrix.build_type }})
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.config.name }} (${{ matrix.build_type }})
+    runs-on: ${{ matrix.config.os }}
     strategy:
       fail-fast: false
       matrix:
         build_type: [Debug, Release]
-        include:
+        config:
           # Microsoft x64: MASM file (MSVC), GAS file (clang-cl)
           - { name: windows-x64-msvc,       os: windows-2025,   vcvars: x64,   compiler: cl,       llvm: x64 }
           - { name: windows-x64-clang-cl,   os: windows-2025,   vcvars: x64,   compiler: clang-cl, llvm: x64 }
@@ -90,12 +95,12 @@ jobs:
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VSPATH=%%i"
           if not defined VSPATH (echo Visual Studio not found & exit /b 1)
           echo Visual Studio: %VSPATH%
-          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }} || exit /b 1
-          if "${{ matrix.compiler }}"=="clang-cl" set "PATH=%VSPATH%\VC\Tools\Llvm\${{ matrix.llvm }}\bin;%PATH%"
-          where ${{ matrix.compiler }} || exit /b 1
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.config.vcvars }} || exit /b 1
+          if "${{ matrix.config.compiler }}"=="clang-cl" set "PATH=%VSPATH%\VC\Tools\Llvm\${{ matrix.config.llvm }}\bin;%PATH%"
+          where ${{ matrix.config.compiler }} || exit /b 1
           where ninja || exit /b 1
           cmake --version || exit /b 1
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=${{ matrix.compiler }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=${{ matrix.config.compiler }} -DCMAKE_CXX_COMPILER=${{ matrix.config.compiler }} || exit /b 1
           cmake --build build --parallel || exit /b 1
 
       - name: Test
@@ -117,10 +122,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x64-gcc,     os: ubuntu-24.04,     cc: gcc,   cxx: g++,     flags: -fcf-protection=full,         note: x86 feature,     features: IBT SHSTK }
-          - { name: linux-x64-clang,   os: ubuntu-24.04,     cc: clang, cxx: clang++, flags: -fcf-protection=full,         note: x86 feature,     features: IBT SHSTK }
-          - { name: linux-arm64-gcc,   os: ubuntu-24.04-arm, cc: gcc,   cxx: g++,     flags: -mbranch-protection=standard, note: AArch64 feature, features: BTI PAC }
-          - { name: linux-arm64-clang, os: ubuntu-24.04-arm, cc: clang, cxx: clang++, flags: -mbranch-protection=standard, note: AArch64 feature, features: BTI PAC }
+          # exe_strict: Ubuntu 24.04's own arm64 startup objects (crt*.o)
+          # carry no BTI/PAC property, so no arm64 executable linked
+          # against them can have it: reported as a warning there.
+          - { name: linux-x64-gcc,     os: ubuntu-24.04,     cc: gcc,   cxx: g++,     flags: -fcf-protection=full,         note: x86 feature,     features: IBT SHSTK, exe_strict: true }
+          - { name: linux-x64-clang,   os: ubuntu-24.04,     cc: clang, cxx: clang++, flags: -fcf-protection=full,         note: x86 feature,     features: IBT SHSTK, exe_strict: true }
+          - { name: linux-arm64-gcc,   os: ubuntu-24.04-arm, cc: gcc,   cxx: g++,     flags: -mbranch-protection=standard, note: AArch64 feature, features: BTI PAC,   exe_strict: false }
+          - { name: linux-arm64-clang, os: ubuntu-24.04-arm, cc: clang, cxx: clang++, flags: -mbranch-protection=standard, note: AArch64 feature, features: BTI PAC,   exe_strict: false }
     env:
       CFLAGS: ${{ matrix.flags }}
       CXXFLAGS: ${{ matrix.flags }}
@@ -146,30 +154,58 @@ jobs:
       # The linker keeps a GNU property only if every input object has it,
       # so a single object without the marker silently disables the feature
       # for the whole binary.
-      # 1. Every object of libcallconv.a (what callconv is responsible for).
-      # 2. The test executable (callconv, doctest, the tests and the system
-      #    startup objects together).
+      # 1. Every object of libcallconv.a has the required features.
+      # 2. The assembly objects have every feature the compiler put on the
+      #    C++ objects (this catches features newer than this list, such as
+      #    GCS, which older readelf prints as "<unknown: 4>").
+      # 3. The test executable (callconv, doctest, the tests and the system
+      #    startup objects together), strict where the system allows it.
       - name: Check GNU properties
         run: |
-          has_features() {
-            local line
-            line=$(readelf -n "$1" | grep -F "${{ matrix.note }}:" || true)
-            for f in ${{ matrix.features }}; do
-              if ! grep -qw "$f" <<< "$line"; then
-                echo "::error::$2: missing $f (properties: '${line:-none}')"
-                return 1
-              fi
-            done
-            echo "$2: ${line## }"
+          # one feature per line, sorted
+          features_of() {
+            readelf -n "$1" | grep -F "${{ matrix.note }}:" | sed 's/.*feature: //' \
+              | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' | sort -u || true
+          }
+          # $1 file, $2 display name, $3 newline-separated required features
+          check() {
+            local have missing
+            have=$(features_of "$1")
+            missing=$(comm -23 <(printf '%s\n' "$3" | grep -v '^$' | sort -u) <(printf '%s\n' "$have"))
+            if [ -n "$missing" ]; then
+              echo "$2: missing $(echo $missing) (has: $(echo ${have:-none}))"
+              return 1
+            fi
+            echo "$2: $(echo $have)"
           }
 
+          required=$(printf '%s\n' ${{ matrix.features }})
           status=0
+
           mkdir -p objs
           (cd objs && ar x ../build/libcallconv.a)
+          compiled=""
           for o in objs/*.o; do
-            has_features "$o" "libcallconv.a($(basename "$o"))" || status=1
+            case "$o" in *.S.o|*.s.o) ;; *) compiled+=$'\n'"$(features_of "$o")" ;; esac
           done
-          has_features build/tests/callconv_tests callconv_tests || status=1
+
+          for o in objs/*.o; do
+            name="libcallconv.a($(basename "$o"))"
+            case "$o" in
+              *.S.o|*.s.o) want="$required"$'\n'"$compiled" ;;
+              *)           want="$required" ;;
+            esac
+            out=$(check "$o" "$name" "$want") || { echo "::error::$out"; status=1; continue; }
+            echo "$out"
+          done
+
+          if out=$(check build/tests/callconv_tests callconv_tests "$required"); then
+            echo "$out"
+          elif [ "${{ matrix.exe_strict }}" = "true" ]; then
+            echo "::error::$out"; status=1
+          else
+            echo "::warning::$out (expected: the system startup objects lack the properties)"
+          fi
           exit $status
 
       - name: Test

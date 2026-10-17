@@ -82,6 +82,16 @@ if(WIN32)
   elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     # clang-cl (or clang targeting MSVC): GNU syntax with .seh_* directives
     enable_language(ASM)
+    # CMake defines no MSVC_DEBUG_INFORMATION_FORMAT flags for ASM compiled
+    # by clang-cl, yet applies the default format (ProgramDatabase in Debug
+    # and RelWithDebInfo) and fails at generation. Empty flags, as CMake
+    # already does for MSVC_RUNTIME_LIBRARY in Windows-Clang-ASM.cmake.
+    # Unwind information does not depend on these flags.
+    foreach(_callconv_fmt IN ITEMS Embedded ProgramDatabase EditAndContinue)
+      if(NOT DEFINED CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_${_callconv_fmt})
+        set(CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_${_callconv_fmt} "")
+      endif()
+    endforeach()
     if(_callconv_arch STREQUAL "x86_64")
       set(_callconv_abi 2)
       set(_callconv_asm_sources "${_callconv_asm_dir}/x86_64_ms_pe_gas.S")
