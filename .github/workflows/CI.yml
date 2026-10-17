@@ -1,0 +1,274 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every configuration is built and tested in Debug and Release, because the
+# compiler-generated calls differ between optimization levels and both must
+# agree with the assembly.
+
+jobs:
+  unix:
+    name: ${{ matrix.name }} (${{ matrix.build_type }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+        include:
+          # System V x86_64, ELF
+          - { name: linux-x64-gcc,     os: ubuntu-24.04,     cc: gcc,   cxx: g++ }
+          - { name: linux-x64-clang,   os: ubuntu-24.04,     cc: clang, cxx: clang++ }
+          # AAPCS64, ELF
+          - { name: linux-arm64-gcc,   os: ubuntu-24.04-arm, cc: gcc,   cxx: g++ }
+          - { name: linux-arm64-clang, os: ubuntu-24.04-arm, cc: clang, cxx: clang++ }
+          # Apple arm64, Mach-O
+          - { name: macos-arm64-appleclang, os: macos-15,    cc: clang, cxx: clang++ }
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang
+
+      - name: Versions
+        run: |
+          cmake --version
+          ${{ matrix.cxx }} --version
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ./build/tests/callconv_tests
+
+  windows:
+    name: ${{ matrix.name }} (${{ matrix.build_type }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+        include:
+          # Microsoft x64: MASM file (MSVC), GAS file (clang-cl)
+          - { name: windows-x64-msvc,       os: windows-2025,   vcvars: x64,   compiler: cl,       llvm: x64 }
+          - { name: windows-x64-clang-cl,   os: windows-2025,   vcvars: x64,   compiler: clang-cl, llvm: x64 }
+          # Windows arm64: armasm64 file (MSVC), GAS file (clang-cl)
+          - { name: windows-arm64-msvc,     os: windows-11-arm, vcvars: arm64, compiler: cl,       llvm: ARM64 }
+          - { name: windows-arm64-clang-cl, os: windows-11-arm, vcvars: arm64, compiler: clang-cl, llvm: ARM64 }
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # One step, because the developer environment set by vcvarsall only
+      # lives in this cmd process. It provides cl, ml64/armasm64, the
+      # Windows SDK INCLUDE paths (ksarm64.h) and the Ninja bundled with
+      # Visual Studio. clang-cl comes from the LLVM bundled with Visual
+      # Studio, so it matches the installed MSVC libraries.
+      - name: Configure and build
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VSPATH=%%i"
+          if not defined VSPATH (echo Visual Studio not found & exit /b 1)
+          echo Visual Studio: %VSPATH%
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }} || exit /b 1
+          if "${{ matrix.compiler }}"=="clang-cl" set "PATH=%VSPATH%\VC\Tools\Llvm\${{ matrix.llvm }}\bin;%PATH%"
+          where ${{ matrix.compiler }} || exit /b 1
+          where ninja || exit /b 1
+          cmake --version || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=${{ matrix.compiler }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} || exit /b 1
+          cmake --build build --parallel || exit /b 1
+
+      - name: Test
+        run: build\tests\callconv_tests.exe
+
+  #####################################################################
+  # Hardening
+  #
+  # Flags are passed through CFLAGS/CXXFLAGS/LDFLAGS, which CMake adds to
+  # its own defaults (setting CMAKE_CXX_FLAGS would replace them, dropping
+  # /EHsc on MSVC). Assembly sources never see these flags, which is
+  # exactly what these jobs verify.
+  #####################################################################
+
+  hardening-linux:
+    name: ${{ matrix.name }} (hardening)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-gcc,     os: ubuntu-24.04,     cc: gcc,   cxx: g++,     flags: -fcf-protection=full,         note: x86 feature,     features: IBT SHSTK }
+          - { name: linux-x64-clang,   os: ubuntu-24.04,     cc: clang, cxx: clang++, flags: -fcf-protection=full,         note: x86 feature,     features: IBT SHSTK }
+          - { name: linux-arm64-gcc,   os: ubuntu-24.04-arm, cc: gcc,   cxx: g++,     flags: -mbranch-protection=standard, note: AArch64 feature, features: BTI PAC }
+          - { name: linux-arm64-clang, os: ubuntu-24.04-arm, cc: clang, cxx: clang++, flags: -mbranch-protection=standard, note: AArch64 feature, features: BTI PAC }
+    env:
+      CFLAGS: ${{ matrix.flags }}
+      CXXFLAGS: ${{ matrix.flags }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang binutils
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # The linker keeps a GNU property only if every input object has it,
+      # so a single object without the marker silently disables the feature
+      # for the whole binary.
+      # 1. Every object of libcallconv.a (what callconv is responsible for).
+      # 2. The test executable (callconv, doctest, the tests and the system
+      #    startup objects together).
+      - name: Check GNU properties
+        run: |
+          has_features() {
+            local line
+            line=$(readelf -n "$1" | grep -F "${{ matrix.note }}:" || true)
+            for f in ${{ matrix.features }}; do
+              if ! grep -qw "$f" <<< "$line"; then
+                echo "::error::$2: missing $f (properties: '${line:-none}')"
+                return 1
+              fi
+            done
+            echo "$2: ${line## }"
+          }
+
+          status=0
+          mkdir -p objs
+          (cd objs && ar x ../build/libcallconv.a)
+          for o in objs/*.o; do
+            has_features "$o" "libcallconv.a($(basename "$o"))" || status=1
+          done
+          has_features build/tests/callconv_tests callconv_tests || status=1
+          exit $status
+
+      - name: Test
+        run: ./build/tests/callconv_tests
+
+  # /guard:cf makes Windows enforce Control Flow Guard at runtime: an
+  # indirect call to an address missing from the image's CFG table
+  # terminates the process. The spill tests call the assembly entry through
+  # typed function pointers from instrumented code, so running them checks
+  # that the entry is a valid CFG target, not only that the flag is set.
+  # /CETCOMPAT (x64 only) opts the image into hardware shadow stacks.
+  hardening-windows:
+    name: ${{ matrix.name }} (hardening)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64-msvc,       os: windows-2025,   vcvars: x64,   compiler: cl,       llvm: x64,   ldflags: /guard:cf /CETCOMPAT, cet: true }
+          - { name: windows-x64-clang-cl,   os: windows-2025,   vcvars: x64,   compiler: clang-cl, llvm: x64,   ldflags: /guard:cf /CETCOMPAT, cet: true }
+          - { name: windows-arm64-msvc,     os: windows-11-arm, vcvars: arm64, compiler: cl,       llvm: ARM64, ldflags: /guard:cf,            cet: false }
+          - { name: windows-arm64-clang-cl, os: windows-11-arm, vcvars: arm64, compiler: clang-cl, llvm: ARM64, ldflags: /guard:cf,            cet: false }
+    env:
+      CFLAGS: /guard:cf
+      CXXFLAGS: /guard:cf
+      LDFLAGS: ${{ matrix.ldflags }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure, build and check
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VSPATH=%%i"
+          if not defined VSPATH (echo Visual Studio not found & exit /b 1)
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }} || exit /b 1
+          if "${{ matrix.compiler }}"=="clang-cl" set "PATH=%VSPATH%\VC\Tools\Llvm\${{ matrix.llvm }}\bin;%PATH%"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.compiler }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} || exit /b 1
+          cmake --build build --parallel || exit /b 1
+          dumpbin /nologo /headers build\tests\callconv_tests.exe > headers.txt || exit /b 1
+          dumpbin /nologo /loadconfig build\tests\callconv_tests.exe > loadconfig.txt || exit /b 1
+          findstr /i /c:"Control Flow Guard" headers.txt || (echo ::error::image is not marked Control Flow Guard & type headers.txt & exit /b 1)
+          findstr /i /c:"CF instrumented" loadconfig.txt || (echo ::error::load config is not CF instrumented & type loadconfig.txt & exit /b 1)
+          if "${{ matrix.cet }}"=="true" findstr /i /c:"CET compatible" headers.txt || (echo ::error::image is not CET compatible & type headers.txt & exit /b 1)
+          exit /b 0
+
+      - name: Test
+        run: build\tests\callconv_tests.exe
+
+  #####################################################################
+  # Sanitizers: AddressSanitizer + UndefinedBehaviorSanitizer
+  #
+  # They instrument the C++ parts (signature building, register images,
+  # spill dispatch) and the tests; the assembly is not instrumented but
+  # every buffer it reads or writes is checked on the C++ side.
+  #####################################################################
+
+  sanitizers:
+    name: ${{ matrix.name }} (asan+ubsan)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-gcc,     os: ubuntu-24.04,     cc: gcc,   cxx: g++ }
+          - { name: linux-x64-clang,   os: ubuntu-24.04,     cc: clang, cxx: clang++ }
+          - { name: linux-arm64-gcc,   os: ubuntu-24.04-arm, cc: gcc,   cxx: g++ }
+          - { name: linux-arm64-clang, os: ubuntu-24.04-arm, cc: clang, cxx: clang++ }
+    env:
+      CFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+      CXXFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+      LDFLAGS: -fsanitize=address,undefined
+      ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1
+      UBSAN_OPTIONS: print_stacktrace=1
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # libclang-rt-18-dev holds clang's sanitizer runtimes (clang 18 is
+      # the Ubuntu 24.04 default); GCC's come with the compiler.
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-rt-18-dev
+
+      # Older sanitizer runtimes cannot map their shadow memory with the
+      # high mmap randomization of recent kernels.
+      - name: Lower mmap randomization
+        run: sudo sysctl -w vm.mmap_rnd_bits=28 || true
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ./build/tests/callconv_tests
