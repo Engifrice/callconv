@@ -6,6 +6,9 @@ Low-level calling convention building blocks for C and C++.
 
 Both are driven by a `callconv_signature`, which precomputes where every parameter lives for the target calling convention.
 
+## Status:
+[![CI](https://github.com/Engifrice/callconv/actions/workflows/CI.yml/badge.svg?branch=main&event=push)](https://github.com/Engifrice/callconv/actions/workflows/CI.yml)
+
 ## Rules
 
 - Scalars only: `bool`, 8/16/32/64-bit integers, `float`, `double`, pointers. Pass aggregates by pointer. No variadic functions.
