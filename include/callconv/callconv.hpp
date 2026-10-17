@@ -248,7 +248,7 @@ namespace callconv
     }
   } // namespace detail
 
-  /// @brief Calls `fn` through `callconv_call`.
+  /// @brief Calls `fn` through `callconv_call` (mainly useful for tests).
   /// Also accepts `noexcept` functions (function pointer conversion).
   /// @pre `sig` describes the type of `fn`
   template<class R, class... A>
